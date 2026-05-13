@@ -1,0 +1,152 @@
+smData=readtable('smart_meter_readings.csv'); %loading data
+collData=readtable('collector_readings.csv');
+
+meterid=unique(smData.MeterID);
+timecode=unique(smData.TimeCode);
+N=numel(meterid);
+T=numel(timecode);
+fprintf('\n[Load] N=%d consumers, T=%d time slots\n', N, T);
+
+P=zeros(T,N);  %consumption matrix
+for i=1:N
+    mask=(smData.MeterID==meterid(i));
+    tc_sub=smData.TimeCode(mask);
+    usage_sub=smData.Usage_kWh(mask);
+    [~, idx]=ismember(tc_sub, timecode);
+    P(idx, i)=usage_sub;
+end
+
+[~,sortIdx]=sort(collData.TimeCode);
+c= collData.Total_Supplied_kWh(sortIdx);
+y =c-sum(P, 2);
+
+slotInDay= mod(timecode,48); %Peak / Off-Peak Split
+onPeakMask=(slotInDay>=16)&(slotInDay<=39);
+offPeakMask= ~onPeakMask;
+
+if T<=2*N
+    error('UNDERDETERMINED: T=%d <= 2N=%d. Add more days.', T, 2*N);
+end
+
+P_off=P(offPeakMask,:); y_off= y(offPeakMask);
+P_peak= P(onPeakMask, :); y_peak=y(onPeakMask);
+T_off=size(P_off,1);
+T_peak=size(P_peak,1);
+
+A=[P_off,zeros(T_off, N);
+          P_peak, P_peak];
+ystack = [y_off; y_peak];
+rkA = rank(A);
+
+AtA=A'*A;
+lam=1e-8* trace(AtA)/(2*N);
+theta =(AtA+lam*eye(2*N))\(A'*ystack);
+
+a_vec=theta(1:N);
+b_vec=theta(N+1:end);
+ab_vec=a_vec+b_vec;
+
+residuals= ystack-A*theta;
+m_obs =length(ystack);
+df=max(m_obs-2*N,1);
+sigma2= sum(residuals.^2)/df;
+
+AtA_inv =inv(AtA +lam*eye(2*N));
+SE = sqrt(sigma2 * diag(AtA_inv));
+SE_a = max(SE(1:N),1e-12);
+SE_b = max(SE(N+1:end),1e-12);
+
+t_a= a_vec ./SE_a;
+t_b= b_vec ./SE_b;
+pval_a=2 * (1-tcdf(abs(t_a),df));
+pval_b=2 * (1-tcdf(abs(t_b),df));
+
+SIG_LEVEL=0.005;
+ZERO_TOL=2 * median(SE_a);
+
+detectedLabels= cell(N, 1);
+attackType= cell(N, 1);
+est_multiplier=zeros(N, 1);
+
+for i=1:N
+    a_sig=(pval_a(i)<SIG_LEVEL);
+    b_sig=(pval_b(i)<SIG_LEVEL);
+    ai= a_vec(i);
+    abi=ab_vec(i);
+
+    if ~a_sig && ~b_sig
+        detectedLabels{i}='HONEST';attackType{i}='none';est_multiplier(i)=1.0;
+    elseif ~b_sig
+        if ai >ZERO_TOL;detectedLabels{i}= 'THIEF';attackType{i}='h1_constant'; est_multiplier(i)=1/(1+ai);
+        elseif ai<-ZERO_TOL;detectedLabels{i}= 'FAULTY';attackType{i}='h1_constant'; est_multiplier(i)=1/(1+ai);
+        else; detectedLabels{i}= 'HONEST';attackType{i} = 'none'; est_multiplier(i)=1.0;
+        end
+    else
+        if  abi>ZERO_TOL && abs(ai) <=ZERO_TOL
+            detectedLabels{i}= 'THIEF';attackType{i}='h2_on_peak'; est_multiplier(i)=1/(1+abi);
+        elseif abi< -ZERO_TOL && abs(ai) <= ZERO_TOL
+            detectedLabels{i}='FAULTY';attackType{i}='h2_on_peak'; est_multiplier(i)=1/(1+abi);
+        elseif abs(abi)<= ZERO_TOL && ai >  ZERO_TOL
+            detectedLabels{i} ='THIEF'; attackType{i}= 'h3_offpeak'; est_multiplier(i)=1/(1+ai);
+        elseif abs(abi)<= ZERO_TOL && ai < -ZERO_TOL
+            detectedLabels{i}='FAULTY';attackType{i}='h3_offpeak'; est_multiplier(i)=1/(1+ai);
+        elseif ai>  ZERO_TOL && abi >  ZERO_TOL
+            detectedLabels{i}= 'THIEF';attackType{i}= 'h1_constant'; est_multiplier(i)=1/(1+max(ai,abi));
+        elseif ai< -ZERO_TOL && abi <-ZERO_TOL
+            detectedLabels{i}= 'FAULTY';attackType{i}='h1_constant'; est_multiplier(i)=1/(1+min(ai,abi));
+        else
+            detectedLabels{i}='INSPECT';attackType{i}='mixed'; est_multiplier(i) =1.0;
+        end
+    end
+end
+
+%% accuracy cvheck
+gtCheck= readtable('groundtruth_d2_mixed.csv');
+correct= 0;
+fprintf('\n%-8s %-14s %-14s  %s\n', 'MeterID','Predicted','True_GT','Match');
+fprintf('%s\n', repmat('-',1,52));
+for i= 1:N
+    row = gtCheck(gtCheck.MeterID== meterid(i), :);
+    if isempty(row),continue; end
+    gt= row.True_Label{1};
+    ok= strcmp(detectedLabels{i}, gt);
+    correct=correct+ok;
+    mark= '✓'; if ~ok, mark=sprintf('✗ (GT=%s)', gt); end
+    fprintf('%-8d %-14s %-14s  %s\n', meterid(i),detectedLabels{i},gt,mark);
+end
+fprintf('%s\n', repmat('-',1,52));
+fprintf('Accuracy vs GT: %d/%d = %.1f%%\n', correct, N, 100*correct/N);
+
+%% csv file
+finalResults = table(meterid, detectedLabels,est_multiplier,attackType,a_vec,b_vec,ab_vec,pval_a,pval_b, 'VariableNames',{'MeterID','Detected_Label','Estimated_Multiplier', ...
+ 'Attack_Type','Alpha_OffPeak','Beta_DetCoeff','AlphaPlusBeta_OnPeak','PVal_Alpha','PVal_Beta'});
+writetable(finalResults, 'cvlr_results.csv');
+fprintf('\nResults saved to cvlr_results.csv\n');
+
+%% plots 
+% plot 1: Off-Peak Anomaly
+figure('Name','CVLR-ETDM: Off-Peak Anomaly');
+bar(meterid, a_vec, 'FaceColor',[0.2 0.5 0.7]); hold on;
+yline(0,'k--','LineWidth',1.2);
+title('Off-Peak Anomaly \alpha_n  (>0=theft, <0=fault)');
+xlabel('Meter ID'); ylabel('\alpha_n'); grid on;
+
+% plot2: on-Peak Anomaly
+figure('Name','CVLR-ETDM: On-Peak Anomaly');
+bar(meterid, ab_vec, 'FaceColor',[0.7 0.3 0.3]); hold on;
+yline(0,'k--','LineWidth',1.2);
+title('On-Peak Anomaly \alpha_n+\beta_n  (>0=theft, <0=fault)');
+xlabel('Meter ID'); ylabel('\alpha_n+\beta_n'); grid on;
+
+%plot3
+figure('Name','CVLR-ETDM: Detection Summary');
+colorMap = containers.Map({'HONEST','THIEF','FAULTY','INSPECT'},{[0.2 0.7 0.2],[0.8 0.2 0.2],[0.9 0.6 0.1],[0.5 0.5 0.5]});
+
+for i= 1:N
+    key=detectedLabels{i};
+    if ~isKey(colorMap,key),key ='INSPECT';end
+    bar(meterid(i),1,'FaceColor',colorMap(key));hold on;
+end
+title('Detection per Meter  (Green=Honest, Red=Thief, Orange=Faulty)');
+xlabel('Meter ID'); yticks([]); grid on;
+legend({'Honest','Thief','Faulty'},'Location','northeast');

@@ -1,0 +1,536 @@
+smData   =readtable('smart_meter_readings.csv');
+collData =readtable('collector_readings.csv');
+
+meterid =sort(unique(smData.MeterID));
+timecode =sort(unique(smData.TimeCode));
+N=numel(meterid);
+T=numel(timecode);
+fprintf('\n[Load] N=%d consumers, T=%d time slots\n', N, T);
+
+%consumption matrix P(TxN)
+P =zeros(T,N);
+for i=1:N
+    mask =(smData.MeterID == meterid(i));
+    tc_sub =smData.TimeCode(mask);
+    val_sub =smData.Usage_kWh(mask);
+    [~, idx]=ismember(tc_sub, timecode);
+    P(idx,i)=val_sub;
+end
+
+[~,srtIdx]=sort(collData.TimeCode);
+c=collData.Total_Supplied_kWh(srtIdx);
+y=c-sum(P,2); %discrepancy vector
+
+fprintf('[Check] y: min=%.4f  max=%.4f  nonzero=%d/%d\n',min(y), max(y), sum(abs(y) > 1e-9), T);
+if sum(abs(y) > 1e-9) < T/2
+    warning('Most y values are zero — verify collector is TRUE utility supply.');
+end
+
+%% AUTO-SELECT NUMBER OF PERIODS
+TC_PER_DAY=48; %48 slots per day
+MAX_PERIODS=6;
+MIN_PERIODS=2;
+MIN_DF= max(20, N);   % minimum degrees of freedom required= 20 to number to consumers
+
+NPERIODS = MIN_PERIODS;
+for k = MAX_PERIODS:-1:MIN_PERIODS
+    df_candidate = T - N * k;
+    if df_candidate >= MIN_DF
+        NPERIODS = k;
+        break
+    end
+end
+
+nParams = N*NPERIODS;
+df_actual = T-nParams;
+
+fprintf('[Auto] Selected NPERIODS=%d  (T=%d, N=%d, nParams=%d, df=%d)\n', ...
+    NPERIODS, T, N, nParams, df_actual);
+if NPERIODS < MAX_PERIODS
+    needed = ceil((N * MAX_PERIODS + MIN_DF) / TC_PER_DAY);
+    fprintf('[Warn] To use %d periods, collect >= %d days of data.\n', ...
+        MAX_PERIODS, needed);
+end
+
+%DEFINE PERIOD BOUNDARIES
+slotsPerPeriod=floor(TC_PER_DAY / NPERIODS);
+PERIOD_BOUNDS=zeros(NPERIODS, 2);
+for k = 1:NPERIODS
+    PERIOD_BOUNDS(k,1)=(k-1)*slotsPerPeriod;
+    PERIOD_BOUNDS(k,2)=k*slotsPerPeriod - 1;
+end
+PERIOD_BOUNDS(NPERIODS,2)= TC_PER_DAY - 1;
+
+PERIOD_NAMES =cell(NPERIODS, 1);
+for k =1:NPERIODS
+    h_start=PERIOD_BOUNDS(k,1) / 2;
+    h_end=(PERIOD_BOUNDS(k,2) + 1) / 2;
+    PERIOD_NAMES{k} = sprintf('P%d(%02.0f:00-%02.0f:00)', k, h_start, h_end);
+end
+
+fprintf('\n[Periods]\n');
+for k = 1:NPERIODS
+    fprintf('  %s : slots %2d-%2d  [%s]\n', PERIOD_NAMES{k}, ...
+        PERIOD_BOUNDS(k,1), PERIOD_BOUNDS(k,2), ...
+        ternary_str(k==1,'REFERENCE','dummy'));
+end
+
+slotInDay  = mod(timecode, TC_PER_DAY);
+periodMask = false(T, NPERIODS);
+for k = 1:NPERIODS
+    periodMask(:,k) = (slotInDay >= PERIOD_BOUNDS(k,1)) &(slotInDay <= PERIOD_BOUNDS(k,2));
+end
+
+A = zeros(T, nParams);
+for k = 1:NPERIODS
+    rows_k = periodMask(:, k);
+    A(rows_k, 1:N) = P(rows_k, :);     % alpha block always active
+    if k >= 2
+        cs = (k-1)*N + 1;
+        ce =  k   *N;
+        A(rows_k, cs:ce) = P(rows_k, :);   % beta_k block
+    end
+end
+
+
+%ridge regression
+fprintf('\n[Matrix] T=%d, nParams=%d, df=%d\n', T, nParams, df_actual);
+
+AtA   = A' * A;
+
+lambda_candidates = logspace(-6, 0, 50) * trace(AtA) / nParams; %It creates 50 values of λ between: 10^-6 to 10^0
+gcv_scores = zeros(size(lambda_candidates)); %to select best lambda automatically
+for li = 1:numel(lambda_candidates)
+    lc    = lambda_candidates(li);
+    H     = A * ((AtA + lc*eye(nParams)) \ A');
+    yhat  = H * y;
+    res   = y - yhat;
+    denom = (1 - trace(H)/T)^2;
+    if denom < 1e-10, gcv_scores(li) = inf; continue; end
+    gcv_scores(li) = mean(res.^2) / denom;
+end
+[~, best_li] = min(gcv_scores);
+lam = lambda_candidates(best_li);
+fprintf('[Ridge] GCV-selected lambda = %.2e\n', lam);
+
+reg   = AtA + lam * eye(nParams);
+theta = reg \ (A' * y);
+
+residuals = y - A * theta;
+sigma2    = sum(residuals.^2) / max(df_actual, 1);
+
+AtA_inv = inv(reg);
+SE_all  = sqrt(sigma2 * diag(AtA_inv));
+SE_all  = max(SE_all, 1e-12);
+
+t_stat = theta ./ SE_all;
+pval   = 2 * (1 - tcdf(abs(t_stat), max(df_actual,1)));
+
+alpha_vec  = theta(1:N);
+pval_alpha = pval(1:N);
+SE_alpha   = SE_all(1:N);
+
+if NPERIODS > 1
+    beta_mat  = reshape(theta(N+1:end), N, NPERIODS-1);
+    pval_beta = reshape(pval(N+1:end),  N, NPERIODS-1);
+else
+    beta_mat  = zeros(N, 0);
+    pval_beta = zeros(N, 0);
+end
+
+%anomaly matrix
+eff_mat = zeros(N, NPERIODS);
+eff_mat(:,1) = alpha_vec;
+for k = 2:NPERIODS
+    eff_mat(:,k) = alpha_vec + beta_mat(:,k-1);
+end
+
+sigma_y    = median(abs(y - median(y))) / 0.6745;  % robust sigma of y
+mean_p     = mean(P(P > 0));                        % mean nonzero consumption
+ZERO_TOL_data = sigma_y / (mean_p * sqrt(N));       % noise-scaled threshold
+
+
+if df_actual >= 50
+    SIG_LEVEL = 0.005;   % original paper level (strict)
+elseif df_actual >= 20
+    SIG_LEVEL = 0.05;    % standard 5% when df is moderate
+else
+    SIG_LEVEL = 0.10;    % relaxed when df is very low
+end
+
+ZERO_TOL = ZERO_TOL_data;
+
+fprintf('[Threshold] sigma_y=%.4f  mean_p=%.4f  ZERO_TOL=%.6f\n',sigma_y, mean_p, ZERO_TOL);
+fprintf('[Threshold] SIG_LEVEL=%.3f  (df=%d)\n', SIG_LEVEL, df_actual);
+
+%SEVERITY THRESHOLDS
+THEFT_MILD_THR   =  0.25;
+THEFT_SEVERE_THR =  1.00;
+FAULT_MILD_THR   = -0.20;
+FAULT_SEVERE_THR = -0.50;
+
+%CLASSIFICATION LOOP
+detectedLabels = cell(N, 1);
+severityLevel = cell(N, 1);
+periodPattern = cell(N, 1);
+fullLabel  = cell(N, 1);
+attackType = cell(N, 1);
+active_periods= cell(N, 1);
+est_m_per_period = ones(N, NPERIODS);
+energy_loss_est=zeros(N, 1);
+risk_score=zeros(N, 1);
+recommendation = cell(N, 1);
+
+avg_daily_kWh=mean(P, 1)' * TC_PER_DAY;
+
+for i = 1:N
+    eff_i = eff_mat(i,:);
+
+    % ── Dual-gate significance ──────────────────────────────────────────
+    % Statistical gate: any coefficient p-value below SIG_LEVEL
+    stat_sig = (pval_alpha(i) < SIG_LEVEL) || ...
+               (NPERIODS > 1 && any(pval_beta(i,:) < SIG_LEVEL));
+
+    % Magnitude gate: max effective anomaly exceeds data-driven threshold
+    mag_sig  = any(abs(eff_i) >= ZERO_TOL);
+
+    is_anomalous = stat_sig || mag_sig;
+
+    % ── Active periods ──────────────────────────────────────────────────
+    pos_p = find(eff_i >  ZERO_TOL);
+    neg_p = find(eff_i < -ZERO_TOL);
+
+    % Reporting multipliers
+    for k = 1:NPERIODS
+        est_m_per_period(i,k) = max(0.01, min(5, 1/(1 + eff_i(k))));
+    end
+
+    if ~is_anomalous
+        % ── HONEST ───────────────────────────────────────────────────────
+        detectedLabels{i}  = 'HONEST';
+        severityLevel{i}   = 'NONE';
+        periodPattern{i}   = 'NONE';
+        fullLabel{i}       = 'HONEST';
+        attackType{i}      = 'none';
+        active_periods{i}  = '';
+        energy_loss_est(i) = 0;
+        risk_score(i)      = 0;
+        recommendation{i}  = 'No action required';
+
+    else
+        % ANOMALOUs
+        n_pos=numel(pos_p);
+        n_neg=numel(neg_p);
+
+        % Base class
+        if n_pos > 0 && n_neg == 0
+            base_class ='THIEF';
+        elseif n_neg > 0 && n_pos == 0
+            base_class='FAULTY';
+        else
+            base_class = 'INSPECT';
+        end
+        detectedLabels{i} =base_class;
+
+        % Period pattern
+        active_p = union(pos_p, neg_p);
+        if numel(active_p) == 0
+            patt = 'CONSTANT';
+        elseif numel(active_p) == NPERIODS
+            % Check if beta coefficients are near zero (truly constant)
+            if NPERIODS > 1 && all(abs(beta_mat(i,:)) < ZERO_TOL)
+                patt = 'CONSTANT';
+            else
+                patt = 'ALL_PERIODS_VARIABLE';
+            end
+        elseif numel(active_p) == 1
+            patt = sprintf('PERIOD_%d_ONLY', active_p);
+        else
+            patt = sprintf('PERIODS_%s', strrep(num2str(active_p(:)'),' ','_'));
+        end
+        periodPattern{i}  = patt;
+        active_periods{i} = num2str(active_p(:)');
+
+        % Severity: worst-case period
+        if ~strcmp(base_class, 'INSPECT')
+            if n_pos > 0
+                [~, widx] = max(eff_i(pos_p));
+                rep_coeff  = eff_i(pos_p(widx));
+            else
+                [~, widx] = min(eff_i(neg_p));
+                rep_coeff  = eff_i(neg_p(widx));
+            end
+            sev=classify_severity(rep_coeff, ZERO_TOL,THEFT_MILD_THR, THEFT_SEVERE_THR,FAULT_MILD_THR, FAULT_SEVERE_THR);
+        else
+            sev = 'MIXED';
+        end
+        severityLevel{i} = sev;
+
+        fullLabel{i}  = sprintf('%s_%s_%s', base_class, sev, patt);
+        attackType{i} = sprintf('%s_%s', base_class, patt);
+
+        % Energy loss estimate
+        frac_per_period = sum(periodMask,1) / TC_PER_DAY;
+        daily_rep = avg_daily_kWh(i);
+        loss = 0;
+        for k = 1:NPERIODS
+            if strcmp(base_class,'THIEF')
+                loss = loss + daily_rep * frac_per_period(k) * max(eff_i(k),0);
+            elseif strcmp(base_class,'FAULTY')
+                loss = loss + daily_rep * frac_per_period(k) * max(-eff_i(k),0);
+            end
+        end
+        energy_loss_est(i) = loss;
+
+        % Risk score
+        switch sev
+            case 'MILD',     sev_num=1;
+            case 'MODERATE', sev_num=2;
+            case 'SEVERE',   sev_num=3;
+            case 'MIXED',    sev_num=2;
+            otherwise,       sev_num=0;
+        end
+        breadth_mult =1.0 + 0.5*(numel(active_p)/NPERIODS);
+        avg_loss_all= mean(avg_daily_kWh);
+        loss_bonus   = min(2, energy_loss_est(i)/max(avg_loss_all,0.01));
+        risk_score(i)= min(10, sev_num * breadth_mult * 2 + loss_bonus);
+
+        recommendation{i} = build_recommendation(base_class, sev, patt, ...
+            risk_score(i), est_m_per_period(i,:), PERIOD_NAMES);
+    end
+end
+
+%accuracy check
+gt_file = 'groundtruth_d2_mixed.csv';
+if isfile(gt_file)
+    gtCheck = readtable(gt_file);
+    correct = 0;
+    fprintf('\n%-8s %-38s %-14s %-14s  %s\n', ...
+        'MeterID','Full_Label','Detected','True_GT','Match');
+    fprintf('%s\n', repmat('-',1,85));
+    for i = 1:N
+        row = gtCheck(gtCheck.MeterID == meterid(i), :);
+        if isempty(row), continue; end
+        gt_lbl = strtrim(row.True_Label{1});
+        if strcmp(gt_lbl,'FAULTY_METER'), gt_lbl = 'FAULTY'; end
+        ok = strcmp(detectedLabels{i}, gt_lbl);
+        correct = correct + ok;
+        mark = '✓';
+        if ~ok, mark = sprintf('✗ (GT=%s)', gt_lbl); end
+        fprintf('%-8d %-38s %-14s %-14s  %s\n', ...
+            meterid(i), fullLabel{i}, detectedLabels{i}, gt_lbl, mark);
+    end
+    fprintf('%s\n', repmat('-',1,85));
+    fprintf('Base-class accuracy: %d/%d = %.1f%%\n\n', correct, N, 100*correct/N);
+end
+
+%results
+effCols = array2table(eff_mat, 'VariableNames', PERIOD_NAMES);
+mCols   = array2table(est_m_per_period,'VariableNames', strcat('Multiplier_', PERIOD_NAMES));
+
+if NPERIODS> 1
+    betaNames = arrayfun(@(k) sprintf('Beta_P%d',k),      2:NPERIODS,'UniformOutput',false);
+    pBetaNames= arrayfun(@(k) sprintf('PVal_Beta_P%d',k), 2:NPERIODS,'UniformOutput',false);
+    betaCols =array2table(beta_mat,  'VariableNames', betaNames);
+    pBetaCols = array2table(pval_beta, 'VariableNames', pBetaNames);
+else
+    betaCols=table();
+    pBetaCols=table();
+end
+
+baseTable = table(meterid, fullLabel, detectedLabels, severityLevel,periodPattern, attackType, active_periods,energy_loss_est, risk_score, recommendation, ...
+    alpha_vec, pval_alpha,'VariableNames',{ ...
+    'MeterID','Full_Label','Base_Class','Severity','Period_Pattern','Attack_Type','Active_Periods','Energy_Loss_kWh_per_Day','Risk_Score_0to10','Recommendation','Alpha_RefPeriod1','PVal_Alpha'});
+
+finalResults=[baseTable, betaCols, pBetaCols, effCols, mCols];
+writetable(finalResults, 'cvlr_adaptive_extended_results.csv');
+fprintf('Results saved to cvlr_adaptive_extended_results.csv\n');
+
+%priority report
+[~, sortRisk] = sort(risk_score,'descend');
+fprintf('\n════════════════════════════ PRIORITY REPORT ════════════════════════════\n');
+fprintf('%-8s %-38s %-6s  %-10s  %s\n', ...
+    'MeterID','Label','Risk','Loss(kWh)','Action');
+fprintf('%s\n', repmat('─',1,90));
+for k = 1:N
+    i = sortRisk(k);
+    if risk_score(i) < 0.1, break; end
+    fprintf('%-8d %-38s %5.1f  %10.3f  %s\n', ...
+        meterid(i), fullLabel{i}, risk_score(i),energy_loss_est(i), recommendation{i});
+end
+fprintf('%s\n', repmat('─',1,90));
+
+%random not necessary
+fprintf('\n[Diagnostic] Effective anomaly range per consumer:\n');
+fprintf('%-8s  %-10s  %-10s  %-10s  %-10s\n','MeterID','max(eff)','min(eff)','alpha','ZERO_TOL');
+fprintf('%s\n', repmat('-',1,55));
+for i = 1:N
+    fprintf('%-8d  %10.4f  %10.4f  %10.4f  %10.4f\n',meterid(i),max(eff_mat(i,:)),min(eff_mat(i,:)),alpha_vec(i),ZERO_TOL);
+end
+
+%plots
+cMapBase = containers.Map({'HONEST','THIEF','FAULTY','INSPECT'},{[0.2 0.7 0.2],[0.85 0.2 0.2],[0.95 0.6 0.1],[0.5 0.5 0.5]});
+
+% Plot 1: Effective anomaly heatmap
+figure('Name','Effective Anomaly Heatmap','Position',[100 100 950 420]);
+imagesc(eff_mat');
+colormap(redblue_cmap(256));
+cv = max(abs(eff_mat(:)));
+if cv > 0, clim([-cv cv]); end
+colorbar;
+hold on;
+% Overlay ZERO_TOL boundary markers
+[row_pos, col_pos] = find(eff_mat' >  ZERO_TOL);
+[row_neg, col_neg] = find(eff_mat' < -ZERO_TOL);
+if ~isempty(row_pos)
+    plot(col_pos, row_pos, 'r^', 'MarkerSize', 8, 'MarkerFaceColor','r');
+end
+if ~isempty(row_neg)
+    plot(col_neg, row_neg, 'bv', 'MarkerSize', 8, 'MarkerFaceColor','b');
+end
+xlabel('Consumer Index'); ylabel('Time Period');
+xticks(1:N);
+xticklabels(arrayfun(@num2str, meterid, 'UniformOutput', false));
+yticks(1:NPERIODS); yticklabels(PERIOD_NAMES);
+title(sprintf('[%d periods] Effective Anomaly  (Red▲=Theft above ZERO\\_TOL | Blue▼=Fault)', NPERIODS));
+grid on;
+
+% Plot 2: Alpha bar with threshold lines
+figure('Name','Alpha Reference Period','Position',[100 100 850 380]);
+bar(1:N, alpha_vec, 'FaceColor',[0.2 0.5 0.7]); hold on;
+yline(0,        'k--','LineWidth',1.5);
+yline( ZERO_TOL,'r-', 'LineWidth',1.5,'DisplayName', sprintf('ZERO\\_TOL=%.3f',ZERO_TOL));
+yline(-ZERO_TOL,'r-', 'LineWidth',1.5,'HandleVisibility','off');
+set(gca,'XTick',1:N,'XTickLabel',arrayfun(@num2str,meterid,'UniformOutput',false));
+legend('Location','northwest');
+title(sprintf('Reference Period Anomaly \\alpha_n  [%s]  (>0=theft | <0=fault)', PERIOD_NAMES{1}));
+xlabel('Meter ID'); ylabel('\alpha_n'); grid on;
+
+% Plot 3: Grouped bar all periods
+figure('Name','Per-Period Anomaly per Consumer','Position',[100 100 1050 420]);
+bh = bar(1:N, eff_mat, 'grouped');
+set(gca,'XTick',1:N,'XTickLabel',arrayfun(@num2str,meterid,'UniformOutput',false));
+legend(PERIOD_NAMES,'Location','northwest','FontSize',7);
+hold on;
+yline(0,        'k--','LineWidth',1.5);
+yline( ZERO_TOL,'r:', 'LineWidth',1.5,'DisplayName',sprintf('ZERO\\_TOL=%.3f',ZERO_TOL));
+yline(-ZERO_TOL,'r:', 'LineWidth',1.5,'HandleVisibility','off');
+xlabel('Meter ID'); ylabel('Effective Anomaly Coefficient');
+title(sprintf('[%d periods] Effective Anomaly per Period per Consumer',NPERIODS));
+grid on;
+
+% Plot 4: Risk score
+figure('Name','Risk Score per Meter','Position',[680 560 820 380]);
+b_h = bar(meterid, risk_score, 0.6);
+b_h.FaceColor = 'flat';
+for i = 1:N, b_h.CData(i,:) = cMapBase(detectedLabels{i}); end
+yline(7,'k-', 'Severe',  'LineWidth',1.5,'LabelVerticalAlignment','bottom');
+yline(4,'k--','Moderate','LineWidth',1.2,'LabelVerticalAlignment','bottom');
+yline(2,'k:', 'Mild',    'LineWidth',1.0,'LabelVerticalAlignment','bottom');
+xlabel('Meter ID'); ylabel('Risk Score (0-10)'); ylim([0 11]);
+title('Composite Risk Score  (Green=Honest | Red=Thief | Orange=Faulty)');
+grid on;
+
+% Plot 5: Full category map
+figure('Name','Full Category Map','Position',[100 560 1100 420]);
+hold on;
+sev_edge = containers.Map( ...
+    {'NONE','MILD','MODERATE','SEVERE','MIXED'}, ...
+    {[0.2 0.7 0.2],[1 0.8 0],[0.9 0.4 0],[0.6 0 0],[0.3 0 0.5]});
+for i = 1:N
+    ht = max(risk_score(i), 0.3);
+    bar(meterid(i), ht, 0.7, ...
+        'FaceColor', cMapBase(detectedLabels{i}), ...
+        'EdgeColor', sev_edge(severityLevel{i}), ...
+        'LineWidth', 2);
+end
+yline(2,'k:','LineWidth',1.0); yline(4,'k--','LineWidth',1.2);
+yline(7,'k-','LineWidth',1.5);
+for i = 1:N
+    if risk_score(i) > 0.5
+        text(meterid(i), risk_score(i)+0.15, strrep(fullLabel{i},'_',' '), ...
+            'HorizontalAlignment','center','FontSize',6,'Rotation',90);
+    end
+end
+xlabel('Meter ID'); ylabel('Risk Score (0-10)');
+title('Extended Detection Map  (Green=Honest | Red=Thief | Orange=Faulty | Edge=Severity)');
+grid on;
+
+% Plot 6: Detection summary
+figure('Name','Detection Summary');
+hold on;
+for i = 1:N
+    key = detectedLabels{i};
+    if ~isKey(cMapBase,key), key='INSPECT'; end
+    bar(meterid(i), 1, 'FaceColor', cMapBase(key));
+end
+title('Detection per Meter  (Green=Honest | Red=Thief | Orange=Faulty | Gray=Inspect)');
+xlabel('Meter ID'); yticks([]); grid on;
+legend({'Honest','Thief','Faulty','Inspect'},'Location','northeast');
+
+% Plot 7: Effective anomaly scatter with ZERO_TOL bands
+figure('Name','Anomaly Scatter with Threshold','Position',[100 100 900 420]);
+colors_scatter = zeros(N, 3);
+for i = 1:N, colors_scatter(i,:) = cMapBase(detectedLabels{i}); end
+for k = 1:NPERIODS
+    subplot(1, NPERIODS, k);
+    for i = 1:N
+        scatter(meterid(i), eff_mat(i,k), 60, colors_scatter(i,:), 'filled'); hold on;
+    end
+    yline(0,        'k--','LineWidth',1.2);
+    yline( ZERO_TOL,'r:','LineWidth',1.5);
+    yline(-ZERO_TOL,'r:','LineWidth',1.5);
+    title(PERIOD_NAMES{k},'FontSize',8);
+    xlabel('Meter ID'); ylabel('\alpha_{eff}');
+    grid on;
+end
+sgtitle('Effective Anomaly per Period  (Red=Theft | Blue=Fault | threshold=red dotted)');
+
+
+
+function s = ternary_str(cond, a, b)
+    if cond, s = a; else, s = b; end
+end
+
+function sev = classify_severity(coeff, ZERO_TOL, ...
+                    THEFT_MILD, THEFT_SEVERE, FAULT_MILD, FAULT_SEVERE)
+    if     coeff >  THEFT_SEVERE,  sev = 'SEVERE';
+    elseif coeff >  THEFT_MILD,    sev = 'MODERATE';
+    elseif coeff >  ZERO_TOL,      sev = 'MILD';
+    elseif coeff <  FAULT_SEVERE,  sev = 'SEVERE';
+    elseif coeff <  FAULT_MILD,    sev = 'MODERATE';
+    elseif coeff < -ZERO_TOL,      sev = 'MILD';
+    else,                           sev = 'NONE';
+    end
+end
+
+function rec = build_recommendation(base, sev, patt, risk, m_vec, pnames)
+    switch sev
+        case 'SEVERE',   urgency = 'URGENT — on-site inspection within 24 h.';
+        case 'MODERATE', urgency = 'HIGH — schedule inspection within 1 week.';
+        case 'MILD',     urgency = 'MONITOR — flag for next routine cycle.';
+        otherwise,       urgency = 'LOW — review records.';
+    end
+    if strcmp(base,'THIEF')
+        pct = round((1 - m_vec) * 100);
+        parts = arrayfun(@(k) sprintf('%s: under-reports %d%%', pnames{k}, pct(k)), ...
+            find(pct > 5), 'UniformOutput', false);
+        if isempty(parts), detail = 'Minor under-reporting detected.';
+        else, detail = ['Affected: ' strjoin(parts,' | ')]; end
+    elseif strcmp(base,'FAULTY')
+        pct = round((m_vec - 1) * 100);
+        parts = arrayfun(@(k) sprintf('%s: over-reads %d%%', pnames{k}, pct(k)), ...
+            find(pct > 5), 'UniformOutput', false);
+        if isempty(parts), detail = 'Minor over-reading detected.';
+        else, detail = ['Affected: ' strjoin(parts,' | ')]; end
+    else
+        detail = 'Mixed anomaly — manual review required.';
+    end
+    rec = [urgency ' ' detail];
+end
+
+function cmap = redblue_cmap(n)
+    half = floor(n/2);
+    cmap = [linspace(0,1,half)', linspace(0,1,half)', ones(half,1);
+            ones(n-half,1), linspace(1,0,n-half)', linspace(1,0,n-half)'];
+end
